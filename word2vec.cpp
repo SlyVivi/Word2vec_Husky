@@ -19,13 +19,14 @@
 #include "lib/aggregator_factory.hpp"
 
 
-int vectorSize = 100; //100 is better
+int vectorSize = 20; //100 is better
 double learningRate = 0.025;
 int numPartitions = 1;
 int numIterations = 3;//nodes' parameters are initialized by zero vectors, so in the first iteration, the word vectors are not updated.
 //int seed = Utils.random.nextLong();
 int minCount = 5; //8 is better
 int windowSize = 5;
+double maxFrequency = 0.02;
 
 class Term {
   public:
@@ -218,34 +219,39 @@ void train(int count, Node* root){
          husky::LOG_I << "begin training";
     }
     list_execute(document_list, {}, {&ac}, [&](Document& doc) {
+            std::vector<Node*> word_nodes_list;
         for (int i = 0; i < doc.words.size(); i++) {
-            std::vector<std::string> context;
+            Node* word_node = search(root, doc.words[i]);
+            word_nodes_list.push_back(word_node);
+        }
+        for (int i = 0; i < doc.words.size(); i++) {
+            std::vector<int> context;
             if ( i < windowSize/2) {
                 for (int j = 0; j <= i + windowSize/2; j++){
                     if (j >= doc.words.size()){
                         break;
                     }
                     if ( i != j){
-                        context.push_back(doc.words[j]);
+                        context.push_back(j);
                     }
                 }
             }
             else{
                 for (int j = i - windowSize/2; j < i; j++){
-                    context.push_back(doc.words[j]);
+                    context.push_back(j);
                 }
                 for (int j = i + 1; j <= i + windowSize/2; j++){
                     if (j >= doc.words.size()){
                         break;
                     }
-                    context.push_back(doc.words[j]);
+                    context.push_back(j);
                 }
             }
             /*if (husky::Context::get_global_tid() == 0) {
                 husky::LOG_I << "i:  " << i << "  Mark, after getting context words";
             }*/
 
-            Node* word_node = search(root, doc.words[i]);
+            Node* word_node = word_nodes_list[i];
             // Words with little frequency are not in the huffman tree.
             if (word_node == NULL){
                 continue;
@@ -254,7 +260,7 @@ void train(int count, Node* root){
             //update nodes on each context path
             std::vector<double> updateWord(vectorSize, 0);
             for (int j = 0; j < context.size(); j++) {
-                Node* context_node = search(root, context[j]);
+                Node* context_node = word_nodes_list[j];
                 // Words with little frequency are not in the huffman tree.
                 if (context_node == NULL){
                     continue;
@@ -455,6 +461,17 @@ auto createVocab() {
     });
    
     auto& ac = husky::lib::AggregatorFactory::get_channel();
+    
+    // calculate the total number of words
+    husky::lib::Aggregator<int> num_total_words(0,
+        [](int& a, const int& b){ a += b; },
+        0
+    );
+
+    auto& num_channel = husky::lib::AggregatorFactory::get_channel();
+    std::vector<husky::ChannelBase*> out_channel;
+    out_channel.push_back(&num_channel);
+    out_channel.push_back(&num_term); 
     /*
     husky::lib::Aggregator<std::vector<int>> wc(std::vector<int>(),
       [](std::vector<int>& a, const std::vector<int>& b) {
@@ -486,15 +503,23 @@ auto createVocab() {
             doc.words.push_back(w);
             //doc.content += " "+w;
             num_term.push(1, w);
+            num_total_words.update(1);
         }
         document_list.add_object(doc);
     }; 
-    load(inputformat, parse);
+    load(inputformat, out_channel, parse);
+    int maxCount = (int) num_total_words.get_value() * maxFrequency;
+    if (husky::Context::get_global_tid() == 0) {
+        husky::LOG_I << "maxCount: " << maxCount;
+    }
 
     // husky::LOG_I << " Finish loading ";
     list_execute(term_list, {&num_term}, {&ac}, [&](Term& t){
         t.count = num_term.get(t);
-        if(t.count > minCount){
+        if(t.count > maxCount){
+            husky::LOG_I << "word " << t.id() << " ,count " << t.count;
+        }
+        if(t.count > minCount && t.count < maxCount){
             wc.update_any([&](std::vector<std::pair<std::string, int>>& v){
                 v.push_back(std::make_pair(t.id(), t.count));
             });
@@ -598,11 +623,57 @@ auto createVocab() {
     // buildHuffmanTree(wc_list);
 }
 
+std::string test(std::string w1, std::string w2, std::string w3, Node* root){
+    Node* node1 = search(root, w1); 
+    Node* node2 = search(root, w2); 
+    Node* node3 = search(root, w3);
+    std::string result;
+    double v1 = 0;
+    double v2 = 0;
+    double v3 = 0;
+    double sim = 0;
+    double maxSim = 0;
+    std::stack<Node*> nodes;
+    std::vector<double> para;
+    for (int i = 0; i < vectorSize; i++){
+        para.push_back(node1->para[i] - node2->para[i] + node3->para[i]);
+        v3 += (node1->para[i] - node2->para[i] + node3->para[i])*(node1->para[i] - node2->para[i] + node3->para[i]);
+    }
+    while (root != NULL || !nodes.empty()){
+        if(root != NULL) {
+            nodes.push(root);
+            root = root->lchild;
+        }
+        else{
+            root = nodes.top();
+            if (root->lchild == NULL && root->rchild == NULL){
+                for(int i = 0; i < vectorSize; i++){
+                    v1 += para[i] * root->para[i];
+                    v2 += root->para[i] * root->para[i];
+                }
+
+                sim = v1/sqrt(v2);
+                if (sim > maxSim && sim > 0.2){
+                    maxSim = sim;
+                    result = root->id();
+                    husky::LOG_I << "word: " << result << "  sim: " << sim/v3;
+                }
+                nodes.pop();
+                root = root->rchild;
+            }
+        }
+    }
+    return result;
+
+}
 void word2vec() {
     if (husky::Context::get_global_tid() == 0) {
         ProfilerStart("/tmp/jiayi/a.prof");
     }
     auto wc_list = createVocab();
+    if (husky::Context::get_local_tid() == 0){
+        husky::LOG_I << "test local id";
+    }
     auto rePair = buildHuffmanTree(wc_list);
     int numNodes = rePair.first;
     Node* root = rePair.second;
@@ -649,11 +720,13 @@ void word2vec() {
                 v3 += (node4->para[i] - node3->para[i]) * (node4->para[i] - node3->para[i]);    
             }
             sim = v1/(sqrt(v2) * sqrt(v3));
-            husky::LOG_I << "after training, similarity2:  " << sim;
+            husky::LOG_I << "after training, similarity:  " << sim;
 
         }
 
     }
+
+    std::string result = test("man", "woman", "boy", root);
     if (husky::Context::get_global_tid() == 0){
         ProfilerStop();
     }
