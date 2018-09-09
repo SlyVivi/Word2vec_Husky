@@ -181,14 +181,9 @@ void tfidf() {
 }
 
 int main(int argc, char** argv) {
-    std::vector<std::string> args;
-    args.push_back("mongo_server");
-    args.push_back("mongo_db");
-    args.push_back("mongo_collection");
-    args.push_back("mongo_user");
-    args.push_back("mongo_pwd");
-    args.push_back("doc_id");
-    args.push_back("doc_content");
+    std::vector<std::string> args =
+        {"mongo_server", "mongo_db", "mongo_collection", "mongo_user",
+        "mongo_pwd", "doc_id", "doc_content"};
     if (husky::init_with_args(argc, argv, args)) {
         husky::run_job(tfidf);
         return 0;
